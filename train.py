@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms, models
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Subset
+import random
 
 transform = transforms.Compose([
   transforms.Resize((224, 224)),
@@ -20,30 +21,43 @@ val_transform = transforms.Compose([
                        [0.229, 0.224, 0.225]),
 ])
 
-# Load full training set to split
+# Load full training set
 full_dataset = datasets.ImageFolder("chest_xray/train", transform=transform)
 val_dataset = datasets.ImageFolder("chest_xray/train", transform=val_transform)
 
-# Split 80/20
-train_size = int(0.8 * len(full_dataset))
-val_size = len(full_dataset) - train_size
-train_indices, val_indices = random_split(range(len(full_dataset)), [train_size, val_size])
+# Separate indices by class
+normal_indices = []
+pneumonia_indices = []
+for i, (_, label) in enumerate(full_dataset):
+  if label == full_dataset.classes.index("NORMAL"):
+    normal_indices.append(i)
+  else:
+    pneumonia_indices.append(i)
 
-train_set = torch.utils.data.Subset(full_dataset, train_indices.indices)
-val_set = torch.utils.data.Subset(val_dataset, val_indices.indices)
+print(f"Original counts: NORMAL={len(normal_indices)}, PNEUMONIA={len(pneumonia_indices)}")
+
+# Undersample pneumonia to match normal count
+random.seed(42)
+pneumonia_indices = random.sample(pneumonia_indices, len(normal_indices))
+balanced_indices = normal_indices + pneumonia_indices
+random.shuffle(balanced_indices)
+
+print(f"After undersampling: {len(balanced_indices)} total ({len(normal_indices)} per class)")
+
+# Split 60/20/20
+train_end = int(0.6 * len(balanced_indices))
+val_end = int(0.8 * len(balanced_indices))
+train_indices = balanced_indices[:train_end]
+val_indices = balanced_indices[train_end:val_end]
+test_indices = balanced_indices[val_end:]
+
+print(f"Split: {len(train_indices)} train / {len(val_indices)} val / {len(test_indices)} test")
+
+train_set = Subset(full_dataset, train_indices)
+val_set = Subset(val_dataset, val_indices)
 
 train_loader = DataLoader(train_set, batch_size=16, shuffle=True)
 val_loader = DataLoader(val_set, batch_size=16)
-
-# Count class distribution for weighted loss
-class_counts = [0, 0]
-for _, label in train_set:
-  class_counts[label] += 1
-
-total = sum(class_counts)
-class_weights = torch.tensor([total / c for c in class_counts], dtype=torch.float32)
-print(f"Class counts: {dict(zip(full_dataset.classes, class_counts))}")
-print(f"Class weights: {class_weights.tolist()}")
 
 # Model setup — unfreeze layer4 + fc
 model = models.resnet50(weights="IMAGENET1K_V1")
@@ -58,9 +72,8 @@ model.fc = nn.Linear(model.fc.in_features, 2)
 
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 model = model.to(device)
-class_weights = class_weights.to(device)
 
-criterion = nn.CrossEntropyLoss(weight=class_weights)
+criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(
   list(model.layer4.parameters()) + list(model.fc.parameters()),
   lr=0.001,
@@ -102,10 +115,19 @@ for epoch in range(num_epochs):
   normal_idx = classes.index("NORMAL")
   pneumonia_idx = classes.index("PNEUMONIA")
 
-  tp = sum(1 for p, l in zip(all_preds, all_labels_list) if p == pneumonia_idx and l == pneumonia_idx)
-  tn = sum(1 for p, l in zip(all_preds, all_labels_list) if p == normal_idx and l == normal_idx)
-  fp = sum(1 for p, l in zip(all_preds, all_labels_list) if p == pneumonia_idx and l == normal_idx)
-  fn = sum(1 for p, l in zip(all_preds, all_labels_list) if p == normal_idx and l == pneumonia_idx)
+  tp = 0
+  tn = 0
+  fp = 0
+  fn = 0
+  for p, l in zip(all_preds, all_labels_list):
+    if p == pneumonia_idx and l == pneumonia_idx:
+      tp += 1
+    elif p == normal_idx and l == normal_idx:
+      tn += 1
+    elif p == pneumonia_idx and l == normal_idx:
+      fp += 1
+    elif p == normal_idx and l == pneumonia_idx:
+      fn += 1
 
   sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
   specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
@@ -126,30 +148,50 @@ with torch.no_grad():
     all_probs.extend(probs[:, pneumonia_idx].cpu().tolist())
     all_labels_list.extend(labels.tolist())
 
-best_threshold = 0.5
-best_j = 0
+MIN_SENSITIVITY = 0.99
+best_threshold = 0.01
+best_spec = 0
 
-for t in [i / 100 for i in range(101)]:
-  preds = [pneumonia_idx if p >= t else normal_idx for p in all_probs]
-  tp = sum(1 for p, l in zip(preds, all_labels_list) if p == pneumonia_idx and l == pneumonia_idx)
-  tn = sum(1 for p, l in zip(preds, all_labels_list) if p == normal_idx and l == normal_idx)
-  fp = sum(1 for p, l in zip(preds, all_labels_list) if p == pneumonia_idx and l == normal_idx)
-  fn = sum(1 for p, l in zip(preds, all_labels_list) if p == normal_idx and l == pneumonia_idx)
+thresholds = []
+for i in range(101):
+  thresholds.append(i / 100)
+
+for t in thresholds:
+  preds = []
+  for p in all_probs:
+    if p >= t:
+      preds.append(pneumonia_idx)
+    else:
+      preds.append(normal_idx)
+
+  tp = 0
+  tn = 0
+  fp = 0
+  fn = 0
+  for p, l in zip(preds, all_labels_list):
+    if p == pneumonia_idx and l == pneumonia_idx:
+      tp += 1
+    elif p == normal_idx and l == normal_idx:
+      tn += 1
+    elif p == pneumonia_idx and l == normal_idx:
+      fp += 1
+    elif p == normal_idx and l == pneumonia_idx:
+      fn += 1
 
   sens = tp / (tp + fn) if (tp + fn) > 0 else 0
   spec = tn / (tn + fp) if (tn + fp) > 0 else 0
-  j = sens + spec - 1
 
-  if j > best_j:
-    best_j = j
+  if sens >= MIN_SENSITIVITY and spec > best_spec:
+    best_spec = spec
     best_threshold = t
 
-print(f"Optimal threshold (Youden's J): {best_threshold}")
+print(f"Optimal threshold (sensitivity >= {MIN_SENSITIVITY}): {best_threshold}")
 
 torch.save({
   "model": model.state_dict(),
   "threshold": best_threshold,
   "classes": full_dataset.classes,
+  "test_indices": test_indices,
 }, "model.pth")
 
 print(f"Model and threshold saved. Classes: {full_dataset.classes}")

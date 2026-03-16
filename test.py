@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torchvision import datasets, transforms, models
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 import matplotlib.pyplot as plt
 
 transform = transforms.Compose([
@@ -11,13 +11,19 @@ transform = transforms.Compose([
                          [0.229, 0.224, 0.225]),
 ])
 
-test_set = datasets.ImageFolder("chest_xray/test", transform=transform)
-test_loader = DataLoader(test_set, batch_size=16)
-
-# Load model and threshold
+# Load checkpoint
 checkpoint = torch.load("model.pth", weights_only=False)
 THRESHOLD = checkpoint["threshold"]
+test_indices = checkpoint["test_indices"]
+classes = checkpoint["classes"]
 print(f"Using threshold from validation: {THRESHOLD}")
+
+# Load the same dataset and extract the held-out test split
+full_dataset = datasets.ImageFolder("chest_xray/train", transform=transform)
+test_set = Subset(full_dataset, test_indices)
+test_loader = DataLoader(test_set, batch_size=16)
+
+print(f"Test set size: {len(test_set)}")
 
 model = models.resnet50(weights=None)
 model.fc = nn.Linear(model.fc.in_features, 2)
@@ -27,7 +33,6 @@ device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 model = model.to(device)
 model.eval()
 
-classes = test_set.classes
 normal_idx = classes.index("NORMAL")
 pneumonia_idx = classes.index("PNEUMONIA")
 
@@ -43,12 +48,26 @@ with torch.no_grad():
         all_labels.extend(labels.tolist())
 
 # Apply threshold
-all_predictions = [pneumonia_idx if p >= THRESHOLD else normal_idx for p in all_probs]
+all_predictions = []
+for p in all_probs:
+    if p >= THRESHOLD:
+        all_predictions.append(pneumonia_idx)
+    else:
+        all_predictions.append(normal_idx)
 
-tp = sum(1 for p, l in zip(all_predictions, all_labels) if p == pneumonia_idx and l == pneumonia_idx)
-tn = sum(1 for p, l in zip(all_predictions, all_labels) if p == normal_idx and l == normal_idx)
-fp = sum(1 for p, l in zip(all_predictions, all_labels) if p == pneumonia_idx and l == normal_idx)
-fn = sum(1 for p, l in zip(all_predictions, all_labels) if p == normal_idx and l == pneumonia_idx)
+tp = 0
+tn = 0
+fp = 0
+fn = 0
+for p, l in zip(all_predictions, all_labels):
+    if p == pneumonia_idx and l == pneumonia_idx:
+        tp += 1
+    elif p == normal_idx and l == normal_idx:
+        tn += 1
+    elif p == pneumonia_idx and l == normal_idx:
+        fp += 1
+    elif p == normal_idx and l == pneumonia_idx:
+        fn += 1
 
 sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
 specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
@@ -65,16 +84,34 @@ print(f"Precision:            {precision:.3f}  — of all pneumonia predictions,
 print(f"\nTotal test images: {len(all_labels)}")
 
 # ROC Curve
-thresholds = [i / 100 for i in range(101)]
+thresholds = []
+for i in range(101):
+    thresholds.append(i / 100)
+
 sensitivities = []
 one_minus_specificities = []
 
 for t in thresholds:
-    preds = [pneumonia_idx if p >= t else normal_idx for p in all_probs]
-    tp_t = sum(1 for p, l in zip(preds, all_labels) if p == pneumonia_idx and l == pneumonia_idx)
-    tn_t = sum(1 for p, l in zip(preds, all_labels) if p == normal_idx and l == normal_idx)
-    fp_t = sum(1 for p, l in zip(preds, all_labels) if p == pneumonia_idx and l == normal_idx)
-    fn_t = sum(1 for p, l in zip(preds, all_labels) if p == normal_idx and l == pneumonia_idx)
+    preds = []
+    for p in all_probs:
+        if p >= t:
+            preds.append(pneumonia_idx)
+        else:
+            preds.append(normal_idx)
+
+    tp_t = 0
+    tn_t = 0
+    fp_t = 0
+    fn_t = 0
+    for p, l in zip(preds, all_labels):
+        if p == pneumonia_idx and l == pneumonia_idx:
+            tp_t += 1
+        elif p == normal_idx and l == normal_idx:
+            tn_t += 1
+        elif p == pneumonia_idx and l == normal_idx:
+            fp_t += 1
+        elif p == normal_idx and l == pneumonia_idx:
+            fn_t += 1
 
     sens = tp_t / (tp_t + fn_t) if (tp_t + fn_t) > 0 else 0
     spec = tn_t / (tn_t + fp_t) if (tn_t + fp_t) > 0 else 0
